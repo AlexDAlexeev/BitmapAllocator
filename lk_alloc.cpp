@@ -31,6 +31,28 @@ public:
 	}
 };
 
+
+double PCFreq = 0.0;
+__int64 CounterStart = 0;
+
+void StartCounter()
+{
+	LARGE_INTEGER li;
+	if (!QueryPerformanceFrequency(&li))
+		return;
+
+	PCFreq = double(li.QuadPart) / 1000.0;
+
+	QueryPerformanceCounter(&li);
+	CounterStart = li.QuadPart;
+}
+double GetCounter()
+{
+	LARGE_INTEGER li;
+	QueryPerformanceCounter(&li);
+	return double(li.QuadPart - CounterStart) / PCFreq;
+}
+
 class AllocatorImpl2
 	: public IAllocator
 {
@@ -39,17 +61,17 @@ class AllocatorImpl2
 	static const size_t BLOCK_CHUNK_COUNT     = 1024; // Number of allocation blocks in every class
 
 	// Number of managed classes
-	static size_t GetBlockClassCount()
+	size_t GetBlockClassCount() const
 	{
 		return BLOCK_MAX_MANGED_SIZE / BLOCK_SIMPLE_RANGE;
 	}
 	// size of memory allocated for specified block class
-	static size_t GetBlockClassSize(size_t blockClass) 
+	size_t GetBlockClassSize(size_t blockClass) const
 	{ 
 		return (blockClass + 1) * BLOCK_SIMPLE_RANGE; 
 	}
 	// calculate block class
-	static size_t GetBlockClass(size_t size)
+	size_t GetBlockClass(size_t size) const
 	{
 		if (size >= BLOCK_MAX_MANGED_SIZE)
 			return (size_t)-1; // Block larger than BLOCK_MAX_MANGED_SIZE processed with standard allocation
@@ -74,13 +96,35 @@ class AllocatorImpl2
 		i = ((i & 0xFFFF0000L) >> 16) + (i & 0x0000FFFFL);
 		return (int)i;
 	}
-
 	// Header for block chunk
 	struct BlockChunkHeader
 	{
 		// Each bit of the bitmap is block busy flag
 		// Must be aligned by sizeof(DWORD) for use with _BitScanForward
+#ifdef _WIN64
+		unsigned char bitmap[((BLOCK_CHUNK_COUNT / 8) + 7) & ~7];
+		static char bitmapEmpty[((BLOCK_CHUNK_COUNT / 8) + 7) & ~7];
+		// Lock block
+		size_t LockAndGetFreeBlock()
+		{
+			for (int b = 0; b < _countof(bitmap); b += sizeof(DWORD64))
+			{
+				DWORD bit = 0;
+				const DWORD64& mask(*((DWORD64*)&bitmap[b]));
+				if (mask == 0) continue;
+				if (!_BitScanForward64(&bit, mask))
+					continue; // No free bits in this DWORD
+				if ((b * 8 + bit) >= BLOCK_CHUNK_COUNT)
+					continue; // No free bit at all
+							  // set bit to indicate lock
+				bitmap[b + bit / 8] &= ~(1 << (bit % 8));
+				return b * 8 + bit; // block number
+			}
+			return -1;
+		}
+#else
 		unsigned char bitmap[((BLOCK_CHUNK_COUNT / 8) + 3) & ~3];
+		static char bitmapEmpty[((BLOCK_CHUNK_COUNT / 8) + 3) & ~3];
 		// Lock block
 		size_t LockAndGetFreeBlock()
 		{
@@ -88,23 +132,25 @@ class AllocatorImpl2
 			{
 				DWORD bit = 0;
 				const DWORD& mask(*((DWORD*)&bitmap[b]));
-				if (!_BitScanForward(&bit, ~mask))
+				if (mask == 0) continue;
+				if (!_BitScanForward(&bit, mask))
 					continue; // No free bits in this DWORD
 				if ((b * 8 + bit) >= BLOCK_CHUNK_COUNT)
 					continue; // No free bit at all
-				// set bit to indicate lock
-				bitmap[b + bit / 8] |= 1 << (bit % 8);
+							  // set bit to indicate lock
+				bitmap[b + bit / 8] &= ~(1 << (bit % 8));
 				return b * 8 + bit; // block number
 			}
 			return -1;
 		}
+#endif // _M_64
 		// Free  block
 		void UnlockBlock(size_t block)
 		{
 			if (block >= BLOCK_CHUNK_COUNT)
 				return; // Something bad input
-			// reset bit for block
-			bitmap[block/8] &= ~(1 << (block % 8));
+			// set bit for block
+			bitmap[block/8] |= 1 << (block % 8);
 		}
 		//
 		size_t GetFreeBlockCount()
@@ -122,28 +168,24 @@ class AllocatorImpl2
 	void AllocateNewChunk()
 	{
 		// Size of pointers to block chunks
-		size_t chunkHeaderSize = GetBlockClassCount() * sizeof(void*);
-
-		size_t totalChunkSize = 0;
+		const size_t chunkHeaderSize = GetBlockClassCount() * sizeof(void*);
 		// Sum of blocks sizes
-		for (size_t i = 0; i < GetBlockClassCount(); i++)
-			totalChunkSize += GetBlockClassSize(i);
-		totalChunkSize *= BLOCK_CHUNK_COUNT;
+		size_t totalChunkSize = chunkHeaderSize;
+		totalChunkSize += BLOCK_CHUNK_COUNT * BLOCK_SIMPLE_RANGE * (1 + GetBlockClassCount()) * GetBlockClassCount() / 2;
 		// Add chunk headers
 		totalChunkSize += GetBlockClassCount() * sizeof(BlockChunkHeader);
-		totalChunkSize += chunkHeaderSize;
 
 		void* newChunk = malloc(totalChunkSize);
-		memset(newChunk, 0, totalChunkSize);
+		m_allocatedChunks.insert(newChunk);
 		// Calculate block addresses
 		void* dataBegin = (char*)newChunk + chunkHeaderSize;
 		void** blockTable = (void**)newChunk;
 		for (size_t i = 0; i < GetBlockClassCount(); i++)
 		{
 			blockTable[i] = dataBegin;
+			memset(dataBegin, 0xFF, sizeof(BlockChunkHeader::bitmap));
 			dataBegin = (char*)dataBegin + BLOCK_CHUNK_COUNT * GetBlockClassSize(i);
 		}
-		m_allocatedChunks.insert(newChunk);
 	}
 	void TestChunkEmptiness(void* chunk)
 	{
@@ -151,7 +193,7 @@ class AllocatorImpl2
 		for (size_t i = 0; i < GetBlockClassCount(); i++)
 		{
 			BlockChunkHeader* chunkHeader = (BlockChunkHeader*)blockTable[i];
-			if (chunkHeader->GetFreeBlockCount() != BLOCK_CHUNK_COUNT)
+			if (memcmp(chunkHeader->bitmap, BlockChunkHeader::bitmapEmpty, sizeof(chunkHeader->bitmap)) != 0)
 				return;
 		}
 		free(chunk);
@@ -176,41 +218,41 @@ class AllocatorImpl2
 public:
 	AllocatorImpl2()
 	{
-		allocations = overhead = 0;
+		memset(BlockChunkHeader::bitmapEmpty, 0xff, sizeof(BlockChunkHeader::bitmapEmpty));
+//		total_alloc = overhead_alloc = allocations = overhead = 0;
 	}
 	~AllocatorImpl2()
 	{
-		_tprintf(TEXT("allocations:%I64u total_overhead:%I64u average:%f"), allocations, overhead, (double)overhead / (double)(allocations == 0 ? 1.0 : allocations));
+		//_tprintf(TEXT("allocations:%I64u total:%I64u total_overhead:%I64u total_overhead:%I64u average:%f\n"), allocations, total_alloc, overhead_alloc, overhead, (double)overhead / (double)(allocations == 0 ? 1.0 : allocations));
 		// Cleanup allocated chunks
 		for (auto& chunk : m_allocatedChunks)
 			free(chunk);
 	}
 
-	unsigned long long overhead;
-	unsigned long long allocations;
+	//unsigned long long overhead;
+	//unsigned long long allocations;
+	//unsigned long long total_alloc;
+	//unsigned long long overhead_alloc;
 
 	void *Alloc(size_t size) const
 	{
-		size_t blockClass = GetBlockClass(size);
+		const size_t blockClass = GetBlockClass(size);
 		if (blockClass == (size_t)-1) 
 			return AllocateStd(size);
 
-		size_t blockClassSize = GetBlockClassSize(blockClass);
-		AllocatorImpl2* pThis = const_cast<AllocatorImpl2*>(this);
-		pThis->allocations++;
-		pThis->overhead += (blockClassSize - size);
+		const size_t blockClassSize = GetBlockClassSize(blockClass);
 		// find free chunk for given class
 		for (void* chunk : m_allocatedChunks)
 		{
 			// block base address
-			void* block = GetBlockChunk(chunk, blockClass);
-			void* data = (char*)block + sizeof(BlockChunkHeader);
+			char* block = (char*)GetBlockChunk(chunk, blockClass);
 			BlockChunkHeader* chunkHeader = (BlockChunkHeader*)block;
+			char* data = block + sizeof(BlockChunkHeader);
 			// find free block in chunk
 			size_t blockNumber = chunkHeader->LockAndGetFreeBlock();
 			if (blockNumber == (size_t)-1)
 				continue; // skip chunk to the next
-			return (char*)data + blockNumber * blockClassSize;
+			return data + blockNumber * blockClassSize;
 		}
 		// No free chunk, need to allocate more
 		const_cast<AllocatorImpl2*>(this)->AllocateNewChunk();
@@ -244,111 +286,31 @@ public:
 		FreeStd(ptr);
 	}
 
-	void DumpChunks()
-	{
-		if (m_allocatedChunks.empty())
-			_tprintf(TEXT("empty!\n"));
-		size_t chunkNr = 0;
-		for (auto& chunk : m_allocatedChunks)
-		{
-			for (size_t blockClass = 0; blockClass < GetBlockClassCount(); blockClass++)
-			{
-				void* block = GetBlockChunk(chunk, blockClass);
-				BlockChunkHeader* chunkHeader = (BlockChunkHeader*)block;
-				size_t freeBlocks = chunkHeader->GetFreeBlockCount();
-				_tprintf(TEXT("chunk:%02d class:%02d free:%d\n"), chunkNr, blockClass, freeBlocks);
-			}
-			chunkNr++;
-		}
-		_tprintf(TEXT("\n"));
-	}
+	//void DumpChunks()
+	//{
+	//	if (m_allocatedChunks.empty())
+	//		_tprintf(TEXT("empty!\n"));
+	//	size_t chunkNr = 0;
+	//	for (auto& chunk : m_allocatedChunks)
+	//	{
+	//		for (size_t blockClass = 0; blockClass < GetBlockClassCount(); blockClass++)
+	//		{
+	//			void* block = GetBlockChunk(chunk, blockClass);
+	//			BlockChunkHeader* chunkHeader = (BlockChunkHeader*)block;
+	//			size_t freeBlocks = chunkHeader->GetFreeBlockCount();
+	//			_tprintf(TEXT("chunk:%02Iu class:%02Iu free:%02Iu\n"), chunkNr, blockClass, freeBlocks);
+	//		}
+	//		chunkNr++;
+	//	}
+	//	_tprintf(TEXT("\n"));
+	//}
 };
-
-int WalkHeap(HANDLE hHeap)
-{
-	DWORD LastError;
-	//HANDLE hHeap;
-	PROCESS_HEAP_ENTRY Entry;
-
-	//
-	// Lock the heap to prevent other threads from accessing the heap
-	// during enumeration.
-	//
-	if (HeapLock(hHeap) == FALSE)
-	{
-		_tprintf(TEXT("Failed to lock heap with LastError %d.\n"),
-		         GetLastError());
-		return 1;
-	}
-
-	_tprintf(TEXT("Walking heap %#p...\n\n"), hHeap);
-
-	Entry.lpData = NULL;
-	while (HeapWalk(hHeap, &Entry) != FALSE)
-	{
-		if ((Entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) != 0)
-		{
-			_tprintf(TEXT("Allocated block"));
-
-			if ((Entry.wFlags & PROCESS_HEAP_ENTRY_MOVEABLE) != 0)
-			{
-				_tprintf(TEXT(", movable with HANDLE %#p"), Entry.Block.hMem);
-			}
-
-			if ((Entry.wFlags & PROCESS_HEAP_ENTRY_DDESHARE) != 0)
-			{
-				_tprintf(TEXT(", DDESHARE"));
-			}
-		}
-		else if ((Entry.wFlags & PROCESS_HEAP_REGION) != 0)
-		{
-			_tprintf(TEXT("Region\n  %d bytes committed\n") \
-			         TEXT("  %d bytes uncommitted\n  First block address: %#p\n") \
-			         TEXT("  Last block address: %#p\n"),
-			         Entry.Region.dwCommittedSize,
-			         Entry.Region.dwUnCommittedSize,
-			         Entry.Region.lpFirstBlock,
-			         Entry.Region.lpLastBlock);
-		}
-		else if ((Entry.wFlags & PROCESS_HEAP_UNCOMMITTED_RANGE) != 0)
-		{
-			_tprintf(TEXT("Uncommitted range\n"));
-		}
-		else
-		{
-			_tprintf(TEXT("Block\n"));
-		}
-
-		_tprintf(TEXT("  Data portion begins at: %#p\n  Size: %d bytes\n") \
-		         TEXT("  Overhead: %d bytes\n  Region index: %d\n\n"),
-		         Entry.lpData,
-		         Entry.cbData,
-		         Entry.cbOverhead,
-		         Entry.iRegionIndex);
-	}
-	LastError = GetLastError();
-	if (LastError != ERROR_NO_MORE_ITEMS)
-	{
-		_tprintf(TEXT("HeapWalk failed with LastError %d.\n"), LastError);
-	}
-
-	//
-	// Unlock the heap to allow other threads to access the heap after
-	// enumeration has completed.
-	//
-	if (HeapUnlock(hHeap) == FALSE)
-	{
-		_tprintf(TEXT("Failed to unlock heap with LastError %d.\n"),
-		         GetLastError());
-	}
-	return 0;
-}
+char AllocatorImpl2::BlockChunkHeader::bitmapEmpty[];
 
 class Event
 {
 private:
 	const char *m_data;
-	size_t m_size;
 	const IAllocator &m_allocator;
 
 	Event();
@@ -359,16 +321,13 @@ public:
 	Event(const IAllocator &allocator)
 		: m_data(nullptr)
 		, m_allocator(allocator)
-		, m_size(0)
 	{
-		m_size = std::rand() % 1024;
-		m_data = (const char *)m_allocator.Alloc(m_size);
+		m_data = (const char *)m_allocator.Alloc(std::rand() % 1024);
 	}
 
 	Event(Event &&other)
 		: m_data(other.m_data)
 		, m_allocator(other.m_allocator)
-		, m_size(other.m_size)
 	{
 		other.m_data = nullptr;
 	}
@@ -378,77 +337,59 @@ public:
 		if (m_data)
 			m_allocator.Free((void*)m_data);
 	}
-	size_t getSize() const { return m_size; }
 };
 
 int _tmain(int argc, _TCHAR* argv[])
 {
-	AllocatorImpl2 allocator;
-	
-	// Test Allocator
-	std::vector<void*> blocks;
-	for (int i = 0; i < 64; i++)
-		blocks.emplace_back(allocator.Alloc(1023));
-
-	allocator.DumpChunks();
-	for (auto& it : blocks)
-		allocator.Free(it);
-	allocator.DumpChunks();
-	blocks.clear();
-
-	void* t1 = allocator.Alloc(1023);
-	allocator.DumpChunks();
-	allocator.Free(t1);
-	allocator.DumpChunks();
-	void* t2 = allocator.Alloc(1023);
-	void* t3 = allocator.Alloc(1023);
-	allocator.Free(t2);
-	allocator.DumpChunks();
-	void* t4 = allocator.Alloc(1023);
-	allocator.DumpChunks();
-	allocator.Free(t1);
-	allocator.Free(t3);
-	allocator.Free(t4);
-	allocator.DumpChunks();
-
- 	for (int i = 0; i < 1025; i++)
- 	{
- 		void* block = allocator.Alloc(i);
- 		memset(block, (unsigned char)i, i);
- 		blocks.push_back(block);
- 	}
- 	for (int i = 0; i < 1025; i++)
- 	{
- 		unsigned char* block = (unsigned char*)blocks[i];
- 		for (int j = 0; j < i; j++)
- 			if (block[j] != (unsigned char)i) DebugBreak();
- 	}
-	allocator.DumpChunks();
-	for (int i = 0; i < 1025; i++)
-		allocator.Free(blocks[i]);
-	allocator.DumpChunks();
-
-
-	std::list<Event> eventsQueue;
-	std::list<std::string> otherLongLifeObjects;
-
-	srand(GetTickCount());
-	int maxQueueSize = (std::rand() % 10000) + 100000;
-	for (int i = 0; i < maxQueueSize; ++i)
+	int iterations = 1000000;
+	for (int i = 0; i < 10; i++)
 	{
-		eventsQueue.emplace_back(Event(allocator));
 
-		if (i % 100 == 0)
-			otherLongLifeObjects.push_back(std::string(std::rand() % 1024, '?'));
+		{
+			StartCounter();
+			AllocatorImpl2 allocator;
+
+			std::list<Event> eventsQueue;
+			std::list<std::string> otherLongLifeObjects;
+
+			srand(GetTickCount());
+			int maxQueueSize = /*(std::rand() % 10000)*/ +iterations;
+			for (int i = 0; i < maxQueueSize; ++i)
+			{
+				eventsQueue.emplace_back(Event(allocator));
+
+				if (i % 100 == 0)
+					otherLongLifeObjects.push_back(std::string(/*std::rand() % */1024, '?'));
+			}
+
+			eventsQueue.clear();
+			//DebugBreak(); // тут проверяем состояние Heap-а
+			otherLongLifeObjects.clear();
+			_tprintf(TEXT("AllocatorImpl:%f\n"), GetCounter());
+		}
+		{
+			StartCounter();
+			AllocatorImpl allocator;
+
+			std::list<Event> eventsQueue;
+			std::list<std::string> otherLongLifeObjects;
+
+			srand(GetTickCount());
+			int maxQueueSize = /*(std::rand() % 10000)*/ +iterations;
+			for (int i = 0; i < maxQueueSize; ++i)
+			{
+				eventsQueue.emplace_back(Event(allocator));
+
+				if (i % 100 == 0)
+					otherLongLifeObjects.push_back(std::string(/*std::rand() % */1024, '?'));
+			}
+
+			eventsQueue.clear();
+			//DebugBreak(); // тут проверяем состояние Heap-а
+			otherLongLifeObjects.clear();
+			_tprintf(TEXT("AllocatorImpl:%f\n"), GetCounter());
+		}
+		_tprintf(TEXT("%d\n"), i);
 	}
-	allocator.DumpChunks();
-	::MessageBox(NULL, TEXT("BEFORE"), TEXT(""), MB_OK);
-	eventsQueue.clear();
-	allocator.DumpChunks();
-	::MessageBox(NULL, TEXT("AFTER"), TEXT(""), MB_OK);
-	//DebugBreak(); // тут проверяем состояние Heap-а
-	otherLongLifeObjects.clear();
-	::MessageBox(NULL, TEXT("EXIT"), TEXT(""), MB_OK);
-
 	return 0;
 }
