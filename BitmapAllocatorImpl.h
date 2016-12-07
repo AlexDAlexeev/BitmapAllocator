@@ -2,12 +2,40 @@
 
 #include <set>
 
+struct IAllocator
+{
+	virtual void *Alloc(size_t size) const = 0;
+	virtual void Free(void *ptr) const = 0;
+};
+
 class BitmapAllocatorImpl
 	: public IAllocator
 {
+public:
+	BitmapAllocatorImpl() {	}
+	~BitmapAllocatorImpl()
+	{
+		// Cleanup allocated chunks
+		for (auto& chunk : m_allocatedChunks)
+			free(chunk);
+	}
+
+	void *Alloc(size_t size) const
+	{
+		return const_cast<BitmapAllocatorImpl*>(this)->AllocImpl(size);
+	}
+
+	void Free(void *ptr) const
+	{
+		return const_cast<BitmapAllocatorImpl*>(this)->FreeImpl(ptr);
+	}
+//private:
 	static const size_t BLOCK_MAX_MANGED_SIZE = 1024; // Maximum managed size
-	static const size_t BLOCK_SIMPLE_RANGE    = BLOCK_MAX_MANGED_SIZE / 64; // Range of every block
-	static const size_t BLOCK_CHUNK_COUNT     = 1024; // Number of allocation blocks in every class
+	static const size_t BLOCK_SIMPLE_RANGE = BLOCK_MAX_MANGED_SIZE / 64; // Range of every block
+	static const size_t BLOCK_CHUNK_COUNT = 1024; // Number of allocation blocks in every class
+
+												  // all memory chunks allocated by allocator
+	std::set<void*> m_allocatedChunks;
 
 	// Number of managed classes
 	size_t GetBlockClassCount() const
@@ -16,20 +44,17 @@ class BitmapAllocatorImpl
 	}
 	// size of memory allocated for specified block class
 	size_t GetBlockClassSize(size_t blockClass) const
-	{ 
-		return (blockClass + 1) * BLOCK_SIMPLE_RANGE; 
+	{
+		return (blockClass + 1) * BLOCK_SIMPLE_RANGE;
 	}
 	// calculate block class
 	size_t GetBlockClass(size_t size) const
 	{
 		if (size >= BLOCK_MAX_MANGED_SIZE)
 			return (size_t)-1; // Block larger than BLOCK_MAX_MANGED_SIZE processed with standard allocation
-		// Here we can implement different strategies for block classification. simple is every 100 bytes will split
+							   // Here we can implement different strategies for block classification. simple is every 100 bytes will split
 		return size / BLOCK_SIMPLE_RANGE; // We've got blocks f.e. 0..127, 128..255 ... 
 	}
-
-	// all memory chunks allocated by allocator
-	std::set<void*> m_allocatedChunks;
 
 	// Header for block chunk
 	struct BlockChunkHeader
@@ -82,8 +107,8 @@ class BitmapAllocatorImpl
 		{
 			if (block >= BLOCK_CHUNK_COUNT)
 				return; // Something bad input
-			// set bit for block
-			bitmap[block/8] |= 1 << (block % 8);
+						// set bit for block
+			bitmap[block / 8] |= 1 << (block % 8);
 		}
 	};
 
@@ -109,21 +134,24 @@ class BitmapAllocatorImpl
 			dataBegin = (char*)dataBegin + BLOCK_CHUNK_COUNT * GetBlockClassSize(i);
 		}
 	}
+
 	void TestChunkEmptiness(void* chunk)
 	{
 		void** blockTable = (void**)chunk;
 		for (size_t i = 0; i < GetBlockClassCount(); i++)
 		{
 			BlockChunkHeader* chunkHeader = (BlockChunkHeader*)blockTable[i];
+
 			for (size_t b = 0; b < sizeof(chunkHeader->bitmap); b += sizeof(DWORD))
 			{
-				if (*((DWORD*)&chunkHeader[b]) != 0xFFFFFFFF)
+				if (*((DWORD*)&chunkHeader->bitmap[b]) != 0xFFFFFFFF)
 					return;
 			}
 		}
 		free(chunk);
 		m_allocatedChunks.erase(chunk);
 	}
+
 	// Get start address of block chunk
 	void* GetBlockChunk(void* chunk, size_t blockClass) const
 	{
@@ -132,29 +160,10 @@ class BitmapAllocatorImpl
 		return blockTable[blockClass];
 	}
 
-	void* AllocateStd(size_t size) const
-	{
-		return malloc(size);
-	}
-	void FreeStd(void* ptr) const
-	{
-		return free(ptr);
-	}
-public:
-	BitmapAllocatorImpl()
-	{
-	}
-	~BitmapAllocatorImpl()
-	{
-		// Cleanup allocated chunks
-		for (auto& chunk : m_allocatedChunks)
-			free(chunk);
-	}
-
-	void *Alloc(size_t size) const
+	void* AllocImpl(size_t size)
 	{
 		const size_t blockClass = GetBlockClass(size);
-		if (blockClass == (size_t)-1) 
+		if (blockClass == (size_t)-1)
 			return AllocateStd(size);
 
 		const size_t blockClassSize = GetBlockClassSize(blockClass);
@@ -175,8 +184,7 @@ public:
 		const_cast<BitmapAllocatorImpl*>(this)->AllocateNewChunk();
 		return Alloc(size);
 	}
-
-	void Free(void *ptr) const
+	void FreeImpl(void* ptr)
 	{
 		// Find chunk for ptr
 		auto& it = m_allocatedChunks.lower_bound(ptr);
@@ -195,11 +203,20 @@ public:
 					// found
 					size_t blockNumber = ((char*)ptr - data) / GetBlockClassSize(blockClass);
 					chunkHeader->UnlockBlock(blockNumber);
-					const_cast<BitmapAllocatorImpl*>(this)->TestChunkEmptiness(chunk);
+					TestChunkEmptiness(chunk);
 					return;
 				}
 			}
 		}
 		FreeStd(ptr);
 	}
+	void* AllocateStd(size_t size) const
+	{
+		return malloc(size);
+	}
+	void FreeStd(void* ptr) const
+	{
+		return free(ptr);
+	}
+public:
 };

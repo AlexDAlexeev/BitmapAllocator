@@ -24,15 +24,12 @@
     <ClInclude Include="targetver.h">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="BitmapAllocatorImpl.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="stdafx.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="lk_alloc.cpp">
+    <ClCompile Include="lk_alloc_test.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
