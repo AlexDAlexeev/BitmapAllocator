@@ -5,7 +5,6 @@
 #include <Windows.h>
 #include <malloc.h>
 
-
 #include <gtest/gtest.h>
 #include "../BitmapAllocatorImpl.h"
 #include <list>
