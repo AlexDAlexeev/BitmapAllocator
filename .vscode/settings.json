@@ -1,0 +1,11 @@
+{
+    "C_Cpp.default.includePath": [
+        "inc"
+    ],
+    "files.associations": {
+        "chrono": "cpp",
+        "format": "cpp",
+        "memory": "cpp",
+        "xiosbase": "cpp"
+    }
+}
